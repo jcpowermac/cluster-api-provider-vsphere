@@ -115,6 +115,18 @@ func (t *CustomTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				log.Error(nil, "Fault Reason: "+soapResp.Body.Fault.Reason.Value)
 				log.Error(nil, "Fault Detail: "+soapResp.Body.Fault.Detail.Content)
 
+				// Log the complete SOAP response for troubleshooting
+				log.Error(nil, "=== COMPLETE SOAP RESPONSE ===")
+				log.Error(nil, "Full SOAP Response Body:")
+				// Split the response into lines for better readability in logs
+				bodyLines := strings.Split(string(body), "\n")
+				for i, line := range bodyLines {
+					if strings.TrimSpace(line) != "" {
+						log.Error(nil, fmt.Sprintf("Line %d: %s", i+1, line))
+					}
+				}
+				log.Error(nil, "=== END SOAP RESPONSE ===")
+
 				// Check if this is an authentication error
 				if strings.Contains(strings.ToLower(soapResp.Body.Fault.Reason.Value), "incorrect user name or password") ||
 					strings.Contains(strings.ToLower(soapResp.Body.Fault.Reason.Value), "cannot complete login") {
@@ -154,6 +166,18 @@ func (t *CustomTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 				log.Error(nil, fmt.Sprintf("=== POTENTIAL PRIVILEGE ISSUE DETECTED (keyword: %s) ===", keyword))
 				log.Error(nil, "Response contains privilege-related content")
 				log.Error(nil, "Please verify user has sufficient vSphere permissions")
+
+				// Log the complete response for privilege troubleshooting
+				log.Error(nil, "=== COMPLETE RESPONSE FOR PRIVILEGE TROUBLESHOOTING ===")
+				log.Error(nil, "Full Response Body:")
+				// Split the response into lines for better readability in logs
+				bodyLines := strings.Split(bodyStr, "\n")
+				for i, line := range bodyLines {
+					if strings.TrimSpace(line) != "" {
+						log.Error(nil, fmt.Sprintf("Line %d: %s", i+1, line))
+					}
+				}
+				log.Error(nil, "=== END PRIVILEGE RESPONSE ===")
 				log.Error(nil, "==================================================")
 				break
 			}
@@ -339,14 +363,14 @@ func GetOrCreate(ctx context.Context, params *Params) (*Session, error) {
 
 func newClient(ctx context.Context, url *url.URL, thumbprint string, _ Feature) (*govmomi.Client, error) {
 	insecure := thumbprint == ""
-	
+
 	customTransport := &CustomTransport{
 		RoundTripper: createTransport(insecure),
 	}
-	
+
 	soapClient := soap.NewClient(url, insecure)
 	soapClient.Transport = customTransport
-	
+
 	if !insecure {
 		soapClient.SetThumbprint(url.Host, thumbprint)
 	}
