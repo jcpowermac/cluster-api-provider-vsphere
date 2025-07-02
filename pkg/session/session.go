@@ -20,9 +20,13 @@ package session
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"fmt"
+	"io"
+	"net/http"
 	"net/netip"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/blang/semver"
@@ -35,6 +39,7 @@ import (
 	"github.com/vmware/govmomi/vapi/tags"
 	"github.com/vmware/govmomi/vim25"
 	"github.com/vmware/govmomi/vim25/soap"
+	"github.com/vmware/govmomi/vim25/xml"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	infrav1 "sigs.k8s.io/cluster-api-provider-vsphere/apis/v1beta1"
@@ -55,6 +60,109 @@ type Session struct {
 	Finder     *find.Finder
 	datacenter *object.Datacenter
 	TagManager *tags.Manager
+}
+
+// SOAPResponse represents the structure of SOAP responses
+type SOAPResponse struct {
+	XMLName xml.Name `xml:"Envelope"`
+	Body    struct {
+		XMLName xml.Name `xml:"Body"`
+		Fault   *struct {
+			XMLName xml.Name `xml:"Fault"`
+			Code    struct {
+				XMLName xml.Name `xml:"faultcode"`
+				Value   string   `xml:",chardata"`
+			} `xml:"faultcode"`
+			Reason struct {
+				XMLName xml.Name `xml:"faultstring"`
+				Value   string   `xml:",chardata"`
+			} `xml:"faultstring"`
+			Detail struct {
+				XMLName xml.Name `xml:"detail"`
+				Content string   `xml:",chardata"`
+			} `xml:"detail"`
+		} `xml:"Fault,omitempty"`
+	} `xml:"Body"`
+}
+
+// CustomTransport wraps the default transport to intercept SOAP responses
+type CustomTransport struct {
+	http.RoundTripper
+}
+
+func (t *CustomTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Call the original transport
+	resp, err := t.RoundTripper.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return resp, err
+	}
+	resp.Body.Close()
+
+	// Check if it's a SOAP response
+	if strings.Contains(string(body), "<soap:Envelope") || strings.Contains(string(body), "<Envelope") {
+		var soapResp SOAPResponse
+		if err := xml.Unmarshal(body, &soapResp); err == nil {
+			if soapResp.Body.Fault != nil {
+				log := ctrl.Log.WithName("vsphere-session")
+				log.Error(nil, "=== SOAP FAULT DETECTED ===")
+				log.Error(nil, "Fault Code: "+soapResp.Body.Fault.Code.Value)
+				log.Error(nil, "Fault Reason: "+soapResp.Body.Fault.Reason.Value)
+				log.Error(nil, "Fault Detail: "+soapResp.Body.Fault.Detail.Content)
+
+				// Check if this is an authentication error
+				if strings.Contains(strings.ToLower(soapResp.Body.Fault.Reason.Value), "incorrect user name or password") ||
+					strings.Contains(strings.ToLower(soapResp.Body.Fault.Reason.Value), "cannot complete login") {
+					log.Error(nil, "=== AUTHENTICATION ERROR DETECTED ===")
+					log.Error(nil, "Please verify your vSphere username and password credentials")
+					log.Error(nil, "================================================")
+				}
+				log.Error(nil, "================================")
+			}
+		}
+
+		// Check for authentication-related error messages in the response
+		bodyStr := string(body)
+		authKeywords := []string{
+			"incorrect user name or password", "cannot complete login", "invalidlogin",
+			"authentication failed", "login failed", "invalid credentials",
+		}
+		for _, keyword := range authKeywords {
+			if strings.Contains(strings.ToLower(bodyStr), strings.ToLower(keyword)) {
+				log := ctrl.Log.WithName("vsphere-session")
+				log.Error(nil, fmt.Sprintf("=== AUTHENTICATION ISSUE DETECTED (keyword: %s) ===", keyword))
+				log.Error(nil, "Response contains authentication-related content")
+				log.Error(nil, "Please verify your vSphere username and password")
+				log.Error(nil, "================================================")
+				break
+			}
+		}
+
+		// Check for privilege-related error messages in the response
+		privilegeKeywords := []string{
+			"privilege", "permission", "access denied", "unauthorized", "forbidden",
+			"NoPermission", "InvalidPrivilege", "insufficient privileges",
+		}
+		for _, keyword := range privilegeKeywords {
+			if strings.Contains(strings.ToLower(bodyStr), strings.ToLower(keyword)) {
+				log := ctrl.Log.WithName("vsphere-session")
+				log.Error(nil, fmt.Sprintf("=== POTENTIAL PRIVILEGE ISSUE DETECTED (keyword: %s) ===", keyword))
+				log.Error(nil, "Response contains privilege-related content")
+				log.Error(nil, "Please verify user has sufficient vSphere permissions")
+				log.Error(nil, "==================================================")
+				break
+			}
+		}
+	}
+
+	// Create a new response with the body
+	resp.Body = io.NopCloser(strings.NewReader(string(body)))
+	return resp, nil
 }
 
 // Feature is a set of Features of the session.
@@ -224,14 +332,21 @@ func GetOrCreate(ctx context.Context, params *Params) (*Session, error) {
 	// Cache the session.
 	sessionCache.Store(sessionKey, &session)
 
-	log.Info("Created and cached vSphere client session")
+	log.Info("Created and cached vSphere client session", "server", params.server, "datacenter", params.datacenter, "username", params.userinfo.Username())
 
 	return &session, nil
 }
 
 func newClient(ctx context.Context, url *url.URL, thumbprint string, _ Feature) (*govmomi.Client, error) {
 	insecure := thumbprint == ""
+	
+	customTransport := &CustomTransport{
+		RoundTripper: createTransport(insecure),
+	}
+	
 	soapClient := soap.NewClient(url, insecure)
+	soapClient.Transport = customTransport
+	
 	if !insecure {
 		soapClient.SetThumbprint(url.Host, thumbprint)
 	}
@@ -248,6 +363,12 @@ func newClient(ctx context.Context, url *url.URL, thumbprint string, _ Feature) 
 	}
 
 	if err := c.Login(ctx, url.User); err != nil {
+		// Check if it's a credential-related error
+		if strings.Contains(err.Error(), "incorrect user name or password") ||
+			strings.Contains(err.Error(), "Cannot complete login") ||
+			strings.Contains(err.Error(), "InvalidLogin") {
+			return nil, errors.Wrapf(err, "vSphere authentication failed - please verify username and password")
+		}
 		return nil, errors.Wrapf(err, "failed to create client: failed to login")
 	}
 
@@ -310,4 +431,19 @@ func (s *Session) findByUUID(ctx context.Context, uuid string, findByInstanceUUI
 		return nil, errors.Wrapf(err, "error finding object by uuid %q", uuid)
 	}
 	return ref, nil
+}
+
+// createTransport creates a transport that respects the insecure flag
+func createTransport(insecure bool) http.RoundTripper {
+	if insecure {
+		// Create a transport that skips TLS verification
+		transport := &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+		return transport
+	}
+	// Use default transport for secure connections
+	return http.DefaultTransport
 }
